@@ -1,0 +1,143 @@
+# Basic Tekton Pipeline Example
+# This example demonstrates a simple pipeline with multiple tasks
+
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: hello-world-task
+spec:
+  params:
+    - name: greeting
+      description: The greeting to display
+      default: "Hello World"
+  steps:
+    - name: echo
+      image: ubuntu
+      command: ["/bin/bash"]
+      args: ["-c", "echo '$(params.greeting)'"]
+
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: git-clone-task
+spec:
+  params:
+    - name: url
+      description: Repository URL to clone
+    - name: revision
+      description: Git revision to checkout
+      default: "main"
+  workspaces:
+    - name: output
+      description: The git repo will be cloned onto the volume backing this workspace
+  steps:
+    - name: clone
+      image: gcr.io/tekton-releases/github.com/tektoncd/pipeline/cmd/git-init:v0.40.2
+      command: ["/ko-app/git-init"]
+      args:
+        - "-url=$(params.url)"
+        - "-revision=$(params.revision)"
+        - "-path=$(workspaces.output.path)"
+
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: build-task
+spec:
+  workspaces:
+    - name: source
+      description: The workspace containing the source code
+  steps:
+    - name: build
+      image: maven:3.8-openjdk-11
+      workingDir: $(workspaces.source.path)
+      command: ["/bin/bash"]
+      args:
+        - -c
+        - |
+          if [ -f "pom.xml" ]; then
+            echo "Maven project detected, building..."
+            mvn clean compile
+          elif [ -f "package.json" ]; then
+            echo "Node.js project detected, building..."
+            npm install
+            npm run build
+          else
+            echo "No recognized build file found"
+            ls -la
+          fi
+
+---
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: basic-pipeline
+spec:
+  params:
+    - name: repo-url
+      description: The git repository URL
+    - name: revision
+      description: The git revision to build
+      default: "main"
+    - name: greeting
+      description: Greeting message
+      default: "Hello from Tekton!"
+  workspaces:
+    - name: shared-data
+      description: Workspace shared between tasks
+  tasks:
+    - name: greet
+      taskRef:
+        name: hello-world-task
+      params:
+        - name: greeting
+          value: $(params.greeting)
+
+    - name: fetch-source
+      taskRef:
+        name: git-clone-task
+      params:
+        - name: url
+          value: $(params.repo-url)
+        - name: revision
+          value: $(params.revision)
+      workspaces:
+        - name: output
+          workspace: shared-data
+
+    - name: build-project
+      taskRef:
+        name: build-task
+      runAfter:
+        - fetch-source
+      workspaces:
+        - name: source
+          workspace: shared-data
+
+---
+# Example PipelineRun to execute the pipeline
+apiVersion: tekton.dev/v1beta1
+kind: PipelineRun
+metadata:
+  name: basic-pipeline-run
+spec:
+  pipelineRef:
+    name: basic-pipeline
+  params:
+    - name: repo-url
+      value: "https://github.com/spring-projects/spring-petclinic.git"
+    - name: revision
+      value: "main"
+    - name: greeting
+      value: "Hello from my Tekton learning journey!"
+  workspaces:
+    - name: shared-data
+      volumeClaimTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 1Gi
