@@ -28,6 +28,19 @@ The default charts target Long-Term-Support (LTS) releases of Jenkins.
 To use other versions, the easiest way is to update the image tag to the version you want.
 You can also rebuild the chart if you want the `appVersion` field to match.
 
+## Learning Tekton with Jenkins
+
+Want to learn Tekton and integrate it with Jenkins? Check out our comprehensive learning guide:
+
+📚 **[Tekton Learning Guide](docs/tekton/README.md)** - Complete guide to learning Tekton with Jenkins integration
+
+This guide includes:
+- Introduction to Tekton concepts and architecture
+- Step-by-step examples and tutorials
+- Jenkins + Tekton integration patterns
+- Advanced topics like custom tasks, triggers, and GitOps
+- Best practices and troubleshooting
+
 ## Contributing
 
 <!-- Keep full URL links to repo files because this README syncs from main to gh-pages.  -->

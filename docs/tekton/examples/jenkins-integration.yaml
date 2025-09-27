@@ -1,0 +1,238 @@
+# Jenkins-Tekton Integration Example
+# This example shows how to integrate Tekton pipelines with Jenkins
+
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: trigger-jenkins-job
+spec:
+  params:
+    - name: jenkins-url
+      description: Jenkins server URL
+    - name: job-name
+      description: Jenkins job name to trigger
+    - name: jenkins-user
+      description: Jenkins username
+    - name: jenkins-token
+      description: Jenkins API token
+  steps:
+    - name: trigger-job
+      image: curlimages/curl:latest
+      command: ["/bin/sh"]
+      args:
+        - -c
+        - |
+          echo "Triggering Jenkins job: $(params.job-name)"
+
+          # Trigger Jenkins job via REST API
+          curl -X POST \
+            "$(params.jenkins-url)/job/$(params.job-name)/build" \
+            --user "$(params.jenkins-user):$(params.jenkins-token)" \
+            --data-urlencode json='{"parameter":[]}'
+
+          echo "Job triggered successfully"
+
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: check-jenkins-job-status
+spec:
+  params:
+    - name: jenkins-url
+      description: Jenkins server URL
+    - name: job-name
+      description: Jenkins job name to check
+    - name: build-number
+      description: Build number to check
+    - name: jenkins-user
+      description: Jenkins username
+    - name: jenkins-token
+      description: Jenkins API token
+  steps:
+    - name: check-status
+      image: curlimages/curl:latest
+      command: ["/bin/sh"]
+      args:
+        - -c
+        - |
+          echo "Checking status of Jenkins job: $(params.job-name) #$(params.build-number)"
+
+          # Check job status via REST API
+          STATUS=$(curl -s \
+            "$(params.jenkins-url)/job/$(params.job-name)/$(params.build-number)/api/json" \
+            --user "$(params.jenkins-user):$(params.jenkins-token)" \
+            | grep -o '"result":"[^"]*"' | cut -d'"' -f4)
+
+          echo "Job status: $STATUS"
+
+          if [ "$STATUS" = "SUCCESS" ]; then
+            echo "Jenkins job completed successfully"
+            exit 0
+          elif [ "$STATUS" = "FAILURE" ]; then
+            echo "Jenkins job failed"
+            exit 1
+          else
+            echo "Jenkins job is still running or status unknown"
+            exit 1
+          fi
+
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: notify-jenkins-completion
+spec:
+  params:
+    - name: tekton-pipeline-name
+      description: Name of the completed Tekton pipeline
+    - name: status
+      description: Pipeline completion status
+    - name: jenkins-webhook-url
+      description: Jenkins webhook URL to notify
+  steps:
+    - name: notify
+      image: curlimages/curl:latest
+      command: ["/bin/sh"]
+      args:
+        - -c
+        - |
+          echo "Notifying Jenkins about Tekton pipeline completion"
+
+          # Send notification to Jenkins webhook
+          curl -X POST \
+            "$(params.jenkins-webhook-url)" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "pipeline": "$(params.tekton-pipeline-name)",
+              "status": "$(params.status)",
+              "timestamp": "'$(date -Iseconds)'"
+            }'
+
+          echo "Notification sent to Jenkins"
+
+---
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: jenkins-tekton-integration
+spec:
+  params:
+    - name: git-url
+      description: Git repository URL
+    - name: git-revision
+      description: Git revision
+      default: "main"
+    - name: jenkins-url
+      description: Jenkins server URL
+    - name: jenkins-job
+      description: Jenkins job to trigger
+    - name: jenkins-user
+      description: Jenkins username
+    - name: jenkins-token
+      description: Jenkins API token
+    - name: jenkins-webhook
+      description: Jenkins webhook URL for notifications
+  workspaces:
+    - name: source-code
+  tasks:
+    # First, clone the source code
+    - name: git-clone
+      taskRef:
+        name: git-clone-task  # Assumes the task from basic-pipeline.yaml exists
+      params:
+        - name: url
+          value: $(params.git-url)
+        - name: revision
+          value: $(params.git-revision)
+      workspaces:
+        - name: output
+          workspace: source-code
+
+    # Run Tekton-based tests
+    - name: tekton-tests
+      runAfter: [git-clone]
+      taskRef:
+        name: build-task  # Assumes the task from basic-pipeline.yaml exists
+      workspaces:
+        - name: source
+          workspace: source-code
+
+    # Trigger Jenkins job for deployment
+    - name: trigger-jenkins-deploy
+      runAfter: [tekton-tests]
+      taskRef:
+        name: trigger-jenkins-job
+      params:
+        - name: jenkins-url
+          value: $(params.jenkins-url)
+        - name: job-name
+          value: $(params.jenkins-job)
+        - name: jenkins-user
+          value: $(params.jenkins-user)
+        - name: jenkins-token
+          value: $(params.jenkins-token)
+
+    # Notify Jenkins about pipeline completion
+    - name: notify-completion
+      runAfter: [trigger-jenkins-deploy]
+      taskRef:
+        name: notify-jenkins-completion
+      params:
+        - name: tekton-pipeline-name
+          value: "jenkins-tekton-integration"
+        - name: status
+          value: "SUCCESS"
+        - name: jenkins-webhook-url
+          value: $(params.jenkins-webhook)
+
+---
+# Secret for Jenkins credentials
+apiVersion: v1
+kind: Secret
+metadata:
+  name: jenkins-credentials
+type: Opaque
+stringData:
+  username: "admin"  # Replace with your Jenkins username
+  token: "your-jenkins-api-token"  # Replace with your Jenkins API token
+
+---
+# Example PipelineRun
+apiVersion: tekton.dev/v1beta1
+kind: PipelineRun
+metadata:
+  name: jenkins-tekton-integration-run
+spec:
+  pipelineRef:
+    name: jenkins-tekton-integration
+  params:
+    - name: git-url
+      value: "https://github.com/spring-projects/spring-petclinic.git"
+    - name: git-revision
+      value: "main"
+    - name: jenkins-url
+      value: "http://jenkins.default.svc.cluster.local:8080"  # Update with your Jenkins service URL
+    - name: jenkins-job
+      value: "deploy-app"  # Replace with your Jenkins job name
+    - name: jenkins-user
+      valueFrom:
+        secretKeyRef:
+          name: jenkins-credentials
+          key: username
+    - name: jenkins-token
+      valueFrom:
+        secretKeyRef:
+          name: jenkins-credentials
+          key: token
+    - name: jenkins-webhook
+      value: "http://jenkins.default.svc.cluster.local:8080/generic-webhook-trigger/invoke"
+  workspaces:
+    - name: source-code
+      volumeClaimTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 1Gi

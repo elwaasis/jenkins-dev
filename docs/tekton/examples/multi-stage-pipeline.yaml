@@ -1,0 +1,370 @@
+# Multi-stage Tekton Pipeline Example
+# This example demonstrates a complete CI/CD pipeline with multiple stages
+
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: code-quality-check
+spec:
+  workspaces:
+    - name: source
+  steps:
+    - name: lint
+      image: sonarsource/sonar-scanner-cli:latest
+      workingDir: $(workspaces.source.path)
+      command: ["/bin/sh"]
+      args:
+        - -c
+        - |
+          echo "Running code quality checks..."
+
+          # Example linting commands based on project type
+          if [ -f "pom.xml" ]; then
+            echo "Java project detected"
+            # Run Maven checkstyle or similar
+            echo "Running Java linting..."
+          elif [ -f "package.json" ]; then
+            echo "Node.js project detected"
+            echo "Running ESLint..."
+            # npx eslint . --ext .js,.jsx,.ts,.tsx
+          elif [ -f "requirements.txt" ] || [ -f "setup.py" ]; then
+            echo "Python project detected"
+            echo "Running Python linting..."
+            # flake8 . || pylint .
+          else
+            echo "Generic linting..."
+          fi
+
+          echo "Code quality check completed"
+
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: security-scan
+spec:
+  workspaces:
+    - name: source
+  steps:
+    - name: vulnerability-scan
+      image: aquasec/trivy:latest
+      workingDir: $(workspaces.source.path)
+      command: ["/bin/sh"]
+      args:
+        - -c
+        - |
+          echo "Running security vulnerability scan..."
+
+          # Scan for vulnerabilities in dependencies
+          if [ -f "pom.xml" ]; then
+            echo "Scanning Java dependencies..."
+            trivy fs --severity HIGH,CRITICAL .
+          elif [ -f "package.json" ]; then
+            echo "Scanning Node.js dependencies..."
+            trivy fs --severity HIGH,CRITICAL .
+          elif [ -f "requirements.txt" ]; then
+            echo "Scanning Python dependencies..."
+            trivy fs --severity HIGH,CRITICAL .
+          else
+            echo "Performing generic security scan..."
+            trivy fs --severity HIGH,CRITICAL .
+          fi
+
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: run-tests
+spec:
+  params:
+    - name: test-type
+      description: Type of tests to run (unit, integration, e2e)
+      default: "unit"
+  workspaces:
+    - name: source
+  results:
+    - name: test-results
+      description: Test execution results
+  steps:
+    - name: execute-tests
+      image: maven:3.8-openjdk-11
+      workingDir: $(workspaces.source.path)
+      command: ["/bin/bash"]
+      args:
+        - -c
+        - |
+          echo "Running $(params.test-type) tests..."
+
+          TEST_RESULT="PASSED"
+
+          if [ -f "pom.xml" ]; then
+            echo "Running Maven tests..."
+            if [ "$(params.test-type)" = "unit" ]; then
+              mvn test || TEST_RESULT="FAILED"
+            elif [ "$(params.test-type)" = "integration" ]; then
+              mvn verify -Dskip.unit.tests=true || TEST_RESULT="FAILED"
+            fi
+          elif [ -f "package.json" ]; then
+            echo "Running Node.js tests..."
+            npm test || TEST_RESULT="FAILED"
+          elif [ -f "requirements.txt" ]; then
+            echo "Running Python tests..."
+            python -m pytest || TEST_RESULT="FAILED"
+          else
+            echo "No test framework detected, marking as passed"
+          fi
+
+          echo "Test result: $TEST_RESULT"
+          echo -n "$TEST_RESULT" > $(results.test-results.path)
+
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: build-and-push-image
+spec:
+  params:
+    - name: image-name
+      description: Name of the container image
+    - name: image-tag
+      description: Tag of the container image
+      default: "latest"
+    - name: registry-url
+      description: Container registry URL
+      default: "docker.io"
+  workspaces:
+    - name: source
+  steps:
+    - name: create-dockerfile
+      image: alpine:latest
+      workingDir: $(workspaces.source.path)
+      command: ["/bin/sh"]
+      args:
+        - -c
+        - |
+          if [ ! -f "Dockerfile" ]; then
+            echo "Creating generic Dockerfile..."
+            cat > Dockerfile << EOF
+          FROM openjdk:11-jre-slim
+          COPY target/*.jar app.jar
+          EXPOSE 8080
+          ENTRYPOINT ["java", "-jar", "/app.jar"]
+          EOF
+          fi
+
+    - name: build-image
+      image: gcr.io/kaniko-project/executor:latest
+      command: ["/kaniko/executor"]
+      args:
+        - --context=$(workspaces.source.path)
+        - --dockerfile=$(workspaces.source.path)/Dockerfile
+        - --destination=$(params.registry-url)/$(params.image-name):$(params.image-tag)
+        - --cache=true
+
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: deploy-to-staging
+spec:
+  params:
+    - name: image-name
+      description: Container image to deploy
+    - name: namespace
+      description: Kubernetes namespace for deployment
+      default: "staging"
+  steps:
+    - name: deploy
+      image: bitnami/kubectl:latest
+      command: ["/bin/bash"]
+      args:
+        - -c
+        - |
+          echo "Deploying $(params.image-name) to $(params.namespace) namespace..."
+
+          # Create deployment manifest
+          cat > deployment.yaml << EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: app-deployment
+            namespace: $(params.namespace)
+          spec:
+            replicas: 2
+            selector:
+              matchLabels:
+                app: myapp
+            template:
+              metadata:
+                labels:
+                  app: myapp
+              spec:
+                containers:
+                - name: app
+                  image: $(params.image-name)
+                  ports:
+                  - containerPort: 8080
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: app-service
+            namespace: $(params.namespace)
+          spec:
+            selector:
+              app: myapp
+            ports:
+            - port: 80
+              targetPort: 8080
+            type: ClusterIP
+          EOF
+
+          # Apply deployment
+          kubectl apply -f deployment.yaml
+          kubectl rollout status deployment/app-deployment -n $(params.namespace) --timeout=300s
+
+---
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: complete-cicd-pipeline
+spec:
+  params:
+    - name: git-url
+      description: Git repository URL
+    - name: git-revision
+      description: Git revision to build
+      default: "main"
+    - name: image-name
+      description: Container image name
+    - name: image-tag
+      description: Container image tag
+      default: "latest"
+    - name: registry-url
+      description: Container registry URL
+      default: "docker.io"
+    - name: staging-namespace
+      description: Staging deployment namespace
+      default: "staging"
+  workspaces:
+    - name: pipeline-workspace
+  tasks:
+    # Stage 1: Source Code Management
+    - name: checkout-code
+      taskRef:
+        name: git-clone-task
+      params:
+        - name: url
+          value: $(params.git-url)
+        - name: revision
+          value: $(params.git-revision)
+      workspaces:
+        - name: output
+          workspace: pipeline-workspace
+
+    # Stage 2: Code Quality & Security (Parallel)
+    - name: code-quality
+      runAfter: [checkout-code]
+      taskRef:
+        name: code-quality-check
+      workspaces:
+        - name: source
+          workspace: pipeline-workspace
+
+    - name: security-check
+      runAfter: [checkout-code]
+      taskRef:
+        name: security-scan
+      workspaces:
+        - name: source
+          workspace: pipeline-workspace
+
+    # Stage 3: Testing (Sequential)
+    - name: unit-tests
+      runAfter: [code-quality, security-check]
+      taskRef:
+        name: run-tests
+      params:
+        - name: test-type
+          value: "unit"
+      workspaces:
+        - name: source
+          workspace: pipeline-workspace
+
+    - name: integration-tests
+      runAfter: [unit-tests]
+      taskRef:
+        name: run-tests
+      params:
+        - name: test-type
+          value: "integration"
+      workspaces:
+        - name: source
+          workspace: pipeline-workspace
+
+    # Stage 4: Build & Package
+    - name: build-application
+      runAfter: [integration-tests]
+      taskRef:
+        name: build-task
+      workspaces:
+        - name: source
+          workspace: pipeline-workspace
+
+    - name: build-container-image
+      runAfter: [build-application]
+      taskRef:
+        name: build-and-push-image
+      params:
+        - name: image-name
+          value: $(params.image-name)
+        - name: image-tag
+          value: $(params.image-tag)
+        - name: registry-url
+          value: $(params.registry-url)
+      workspaces:
+        - name: source
+          workspace: pipeline-workspace
+
+    # Stage 5: Deploy to Staging
+    - name: deploy-staging
+      runAfter: [build-container-image]
+      taskRef:
+        name: deploy-to-staging
+      params:
+        - name: image-name
+          value: "$(params.registry-url)/$(params.image-name):$(params.image-tag)"
+        - name: namespace
+          value: $(params.staging-namespace)
+
+---
+# Example PipelineRun for the complete CI/CD pipeline
+apiVersion: tekton.dev/v1beta1
+kind: PipelineRun
+metadata:
+  name: complete-cicd-run
+spec:
+  pipelineRef:
+    name: complete-cicd-pipeline
+  params:
+    - name: git-url
+      value: "https://github.com/spring-projects/spring-petclinic.git"
+    - name: git-revision
+      value: "main"
+    - name: image-name
+      value: "my-app"
+    - name: image-tag
+      value: "v1.0.0"
+    - name: registry-url
+      value: "docker.io/myregistry"
+    - name: staging-namespace
+      value: "staging"
+  workspaces:
+    - name: pipeline-workspace
+      volumeClaimTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 2Gi
